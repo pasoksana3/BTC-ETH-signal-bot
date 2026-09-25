@@ -1,971 +1,377 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-MEXC Futures -> Telegram signal bot
------------------------------------
-Один файл. Бот:
-1) отримує USDT-M perpetual контракти MEXC;
-2) сканує 5m свічки;
-3) шукає серію 4-6 однакових свічок + виснаження + свічку підтвердження;
-4) будує 10m з 5m локально;
-5) для кандидата перевіряє 15m та 1h;
-6) розраховує TP1 = 0.50%, TP2 = 0.70%;
-7) надсилає сигнал у Telegram;
-8) не відкриває угоди автоматично.
-
-ВАЖЛИВО:
-- SCORE 85+ — це внутрішній технічний score, НЕ статистична ймовірність 85%.
-- Реальні 85-100% win-rate можна заявляти лише після окремого backtest.
-"""
-
-import json
-import math
-import os
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os, time, math, logging, asyncio
 from datetime import datetime, timezone
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-# ============================================================
-#                 НАЛАШТУВАННЯ — ЗАПОВНИ ЦЕ
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = "8812030381:AAG-8ZTc-xG824MCUosIwoMjsHNVhb-2-Lc"
-TELEGRAM_CHAT_ID = "-5417788354"
-
-# Як часто запускати повний цикл.
-# Для всіх монет рекомендовано 30-60 сек.
-SCAN_SECONDS = 60
-
-# 0 = усі USDT perpetual контракти.
-# Наприклад 100 = тільки 100 найбільш активних.
-MAX_SYMBOLS = 0
-
-# Мінімальний внутрішній score сигналу.
-MIN_SCORE = 85
-
-# Скільки паралельних worker'ів використовувати.
-# Залишено помірним, щоб не створювати зайве навантаження на API.
-MAX_WORKERS = 6
-
-# Мінімальний обсяг тіла останньої свічки відносно ціни.
-# 0.0002 = 0.02%.
-MIN_BODY_PCT = 0.0002
-
-# Не надсилати повторний сигнал для того самого symbol/tf/direction
-# протягом цього часу.
-COOLDOWN_MINUTES = 30
-
-# Якщо True — після запуску надсилається тестове повідомлення.
-SEND_STARTUP_MESSAGE = True
-
-MEXC_BASE = "https://contract.mexc.com"
-TELEGRAM_BASE = "https://api.telegram.org/bot"
-
-# Інтервали MEXC, які використовуємо напряму.
-TF_5M = "Min5"
-TF_15M = "Min15"
-TF_1H = "Min60"
-
+import requests
+import pandas as pd
 
 # ============================================================
-#                 ГЛОБАЛЬНИЙ СТАН
+# MEXC ENTRY POINT BOT
+# Strategy:
+# 1H direction -> 1H zone/imbalance -> liquidity sweep ->
+# 15m CHoCH/BOS -> POI/FVG -> entry -> SL/TP.
+# Alert only. No order execution.
 # ============================================================
 
-last_sent = {}          # (symbol, tf, direction) -> candle_timestamp
-last_sent_time = {}    # (symbol, tf, direction) -> unix time
-request_lock = threading.Lock()
-last_request_time = 0.0
+MEXC_BASE = os.getenv("MEXC_BASE", "https://api.mexc.com")
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "45"))
 
-# ============================================================
-#                 HTTP
-# ============================================================
+# Entry-quality filters
+SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "3"))
+SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "12"))
+ZONE_LOOKBACK = int(os.getenv("ZONE_LOOKBACK", "80"))
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+MIN_RR = float(os.getenv("MIN_RR", "1.5"))
+TP1_RR = float(os.getenv("TP1_RR", "1.5"))
+TP2_RR = float(os.getenv("TP2_RR", "2.2"))
+SL_ATR_BUFFER = float(os.getenv("SL_ATR_BUFFER", "0.15"))
 
-def http_json(url, params=None, timeout=15):
-    global last_request_time
+COINS = [
+    "BTC","ETH","SOL","XRP","DOGE","SUI","AVAX","LINK","DOT","LTC",
+    "APT","ARB","OP","PEPE","WIF","INJ","FIL","ATOM","UNI","TON",
+    "SEI","TRX","NEAR","PYTH","ADA","ENA","BNB","BCH","ETC","XLM"
+]
 
-    if params:
-        url = url + "?" + urlencode(params)
+session = requests.Session()
+session.headers.update({"Content-Type": "application/json", "User-Agent": "MEXC-EntryPoint-Bot/1.0"})
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-    # Простий глобальний rate limiter.
-    # ~8-9 запитів/сек максимум.
-    with request_lock:
-        now = time.time()
-        wait = 0.12 - (now - last_request_time)
-        if wait > 0:
-            time.sleep(wait)
-        last_request_time = time.time()
+last_sent = {}
 
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "MEXC-Signal-Bot/1.0",
-            "Accept": "application/json",
-        },
-        method="GET",
-    )
+def symbol_for(coin):
+    return f"{coin}_USDT"
 
-    try:
-        with urlopen(req, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
-        print(f"[HTTP ERROR] {url} -> {e}")
-        return None
-
-
-# ============================================================
-#                 TELEGRAM
-# ============================================================
-
-def telegram_send(text):
-    if not TELEGRAM_BOT_TOKEN or "8812030381:AAG-8ZTc-xG824MCUosIwoMjsHNVhb-2-Lc" in TELEGRAM_BOT_TOKEN:
-        print("[TELEGRAM] Не заданий TELEGRAM_BOT_TOKEN")
-        return False
-
-    if not TELEGRAM_CHAT_ID or "-5417788354" in str(TELEGRAM_CHAT_ID):
-        print("[TELEGRAM] Не заданий TELEGRAM_CHAT_ID")
-        return False
-
-    url = TELEGRAM_BASE + TELEGRAM_BOT_TOKEN + "/sendMessage"
-    payload = json.dumps({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
-    }).encode("utf-8")
-
-    req = Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "MEXC-Signal-Bot/1.0",
-        },
-        method="POST",
-    )
-
-    try:
-        with urlopen(req, timeout=15) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            if result.get("ok"):
-                return True
-            print("[TELEGRAM ERROR]", result)
-            return False
-    except Exception as e:
-        print("[TELEGRAM ERROR]", e)
-        return False
-
-
-# ============================================================
-#                 MEXC
-# ============================================================
+def mexc_get(path, params=None):
+    r = session.get(MEXC_BASE + path, params=params or {}, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(str(data))
+    return data
 
 def get_contracts():
-    data = http_json(MEXC_BASE + "/api/v1/contract/detail")
-    if not data or not data.get("success"):
-        return []
+    data = mexc_get("/api/v1/contract/detail")
+    rows = data.get("data", data) if isinstance(data, dict) else data
+    active = set()
+    if isinstance(rows, list):
+        for x in rows:
+            sym = x.get("symbol")
+            state = x.get("state", 0)
+            if sym and str(state) in ("0", "1"):
+                active.add(sym)
+    return active
 
-    result = data.get("data", [])
-    symbols = []
+def get_klines(symbol, interval, limit=250):
+    # MEXC contract K-line uses interval values such as Min15, Min60.
+    path = f"/api/v1/contract/kline/{symbol}"
+    data = mexc_get(path, {"interval": interval})
+    d = data.get("data", data)
+    if not isinstance(d, dict):
+        raise RuntimeError(f"Unexpected kline response for {symbol}")
+    keys = ["time","open","high","low","close","vol"]
+    if not all(k in d for k in keys):
+        raise RuntimeError(f"Missing kline fields for {symbol}")
+    n = min(len(d[k]) for k in keys)
+    n = min(n, limit)
+    rows = []
+    for i in range(-n, 0):
+        rows.append({
+            "time": int(d["time"][i]),
+            "open": float(d["open"][i]),
+            "high": float(d["high"][i]),
+            "low": float(d["low"][i]),
+            "close": float(d["close"][i]),
+            "volume": float(d["vol"][i]),
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise RuntimeError("No candles")
+    df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    # Drop current, still-forming candle.
+    if len(df) > 3:
+        df = df.iloc[:-1].copy()
+    return df
 
-    for x in result:
-        symbol = x.get("symbol")
-        quote = str(x.get("quoteCoin", "")).upper()
-        state = x.get("state")
+def atr(df, period=14):
+    h, l, c = df.high, df.low, df.close
+    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1])
 
-        # Беремо USDT perpetual контракти.
-        if not symbol:
-            continue
-
-        if quote != "USDT":
-            continue
-
-        # state=0 зазвичай означає активний контракт.
-        if state not in (None, 0, "0"):
-            continue
-
-        symbols.append(symbol)
-
-    return sorted(set(symbols))
-
-
-def get_tickers():
-    """
-    Необов'язкова функція для сортування за активністю.
-    Якщо endpoint не поверне список — бот просто працюватиме без фільтра.
-    """
-    data = http_json(MEXC_BASE + "/api/v1/contract/ticker")
-    if not data or not data.get("success"):
-        return {}
-
-    result = data.get("data")
-
-    if not isinstance(result, list):
-        return {}
-
-    out = {}
-    for x in result:
-        symbol = x.get("symbol")
-        if not symbol:
-            continue
-
-        volume = (
-            x.get("volume")
-            or x.get("holdVol")
-            or x.get("amount")
-            or 0
-        )
-
-        try:
-            volume = float(volume)
-        except Exception:
-            volume = 0.0
-
-        out[symbol] = volume
-
-    return out
-
-
-def get_klines(symbol, interval, limit=120):
-    """
-    MEXC contract kline:
-    GET /api/v1/contract/kline/{symbol}
-
-    Повертаємо список словників:
-    time/open/high/low/close/vol
-    """
-    now = int(time.time())
-    seconds = {
-        "Min5": 300,
-        "Min15": 900,
-        "Min60": 3600,
-    }.get(interval, 300)
-
-    start = now - seconds * (limit + 5)
-
-    url = MEXC_BASE + f"/api/v1/contract/kline/{symbol}"
-    data = http_json(
-        url,
-        params={
-            "interval": interval,
-            "start": start,
-            "end": now,
-        },
-        timeout=15,
-    )
-
-    if not data or not data.get("success"):
-        return []
-
-    raw = data.get("data")
-    if not isinstance(raw, dict):
-        return []
-
-    try:
-        times = raw.get("time", [])
-        opens = raw.get("open", [])
-        closes = raw.get("close", [])
-        highs = raw.get("high", [])
-        lows = raw.get("low", [])
-        vols = raw.get("vol", [])
-
-        n = min(
-            len(times),
-            len(opens),
-            len(closes),
-            len(highs),
-            len(lows),
-            len(vols),
-        )
-
-        candles = []
-
-        for i in range(n):
-            candles.append({
-                "time": int(times[i]),
-                "open": float(opens[i]),
-                "close": float(closes[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "vol": float(vols[i]),
-            })
-
-        candles.sort(key=lambda x: x["time"])
-
-        # Відкидаємо поточну незакриту свічку.
-        if candles:
-            last = candles[-1]["time"]
-            if now < last + seconds:
-                candles = candles[:-1]
-
-        return candles[-limit:]
-
-    except Exception as e:
-        print(f"[KLINE ERROR] {symbol} {interval}: {e}")
-        return []
-
-
-# ============================================================
-#                 МАТЕМАТИКА / ІНДИКАТОРИ
-# ============================================================
-
-def sma(values, period):
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
-
-def candle_color(c):
-    if c["close"] > c["open"]:
-        return "GREEN"
-    if c["close"] < c["open"]:
-        return "RED"
-    return "DOJI"
-
-
-def body(c):
-    return abs(c["close"] - c["open"])
-
-
-def range_size(c):
-    return max(c["high"] - c["low"], 1e-12)
-
-
-def body_pct(c):
-    mid = max(abs(c["close"]), 1e-12)
-    return body(c) / mid
-
-
-def upper_wick(c):
-    return c["high"] - max(c["open"], c["close"])
-
-
-def lower_wick(c):
-    return min(c["open"], c["close"]) - c["low"]
-
-
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-
-    trs = []
-    for i in range(1, len(candles)):
-        c = candles[i]
-        p = candles[i - 1]
-
-        tr = max(
-            c["high"] - c["low"],
-            abs(c["high"] - p["close"]),
-            abs(c["low"] - p["close"]),
-        )
-        trs.append(tr)
-
-    if len(trs) < period:
-        return None
-
-    return sum(trs[-period:]) / period
-
-
-def aggregate_10m_from_5m(candles):
-    """
-    Створює 10m із 5m локально.
-    MEXC docs не використовує Min10, тому це робимо всередині бота.
-    """
-    buckets = {}
-
-    for c in candles:
-        bucket = (c["time"] // 600) * 600
-
-        if bucket not in buckets:
-            buckets[bucket] = {
-                "time": bucket,
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "vol": c["vol"],
-                "_count": 1,
-            }
-        else:
-            b = buckets[bucket]
-            b["high"] = max(b["high"], c["high"])
-            b["low"] = min(b["low"], c["low"])
-            b["close"] = c["close"]
-            b["vol"] += c["vol"]
-            b["_count"] += 1
-
+def pivot_highs(df, left=3, right=3):
     out = []
-    now = int(time.time())
-
-    for k in sorted(buckets):
-        b = buckets[k]
-
-        # Беремо лише повні 10m свічки.
-        if b["_count"] >= 2 and now >= b["time"] + 600:
-            b = dict(b)
-            b.pop("_count", None)
-            out.append(b)
-
+    for i in range(left, len(df)-right):
+        v = df.high.iloc[i]
+        if v == df.high.iloc[i-left:i+right+1].max():
+            out.append((i, float(v)))
     return out
 
+def pivot_lows(df, left=3, right=3):
+    out = []
+    for i in range(left, len(df)-right):
+        v = df.low.iloc[i]
+        if v == df.low.iloc[i-left:i+right+1].min():
+            out.append((i, float(v)))
+    return out
 
-# ============================================================
-#                 PATTERN ENGINE
-# ============================================================
+def fvg_bull(df, i):
+    # 3-candle bullish imbalance: candle i low > candle i-2 high
+    return i >= 2 and df.low.iloc[i] > df.high.iloc[i-2]
 
-def find_base_pattern(candles):
-    """
-    Основна ідея з наших скрінів:
+def fvg_bear(df, i):
+    return i >= 2 and df.high.iloc[i] < df.low.iloc[i-2]
 
-    4-6 однакових свічок
-    -> поступове виснаження
-    -> протилежна confirmation-свічка
-    -> перетин/повернення через MA5
-    -> перевірка волатильності
+def htf_direction(df):
+    # Structure-based 1H bias, not a moving-average-only signal.
+    highs = pivot_highs(df, 3, 3)
+    lows = pivot_lows(df, 3, 3)
+    if len(highs) < 2 or len(lows) < 2:
+        return None, "insufficient structure"
+    h1, h2 = highs[-1][1], highs[-2][1]
+    l1, l2 = lows[-1][1], lows[-2][1]
+    close = float(df.close.iloc[-1])
+    if h1 > h2 and l1 > l2 and close > l2:
+        return "LONG", "1H higher-high + higher-low structure"
+    if h1 < h2 and l1 < l2 and close < h2:
+        return "SHORT", "1H lower-high + lower-low structure"
+    # If structure is mixed, allow close relative to recent range midpoint.
+    rh = max(x[1] for x in highs[-3:])
+    rl = min(x[1] for x in lows[-3:])
+    mid = (rh + rl) / 2
+    if close > mid:
+        return "LONG", "1H range location above midpoint"
+    if close < mid:
+        return "SHORT", "1H range location below midpoint"
+    return None, "1H range/no directional edge"
 
-    Повертає кандидат або None.
-    """
-
-    if len(candles) < 60:
-        return None
-
-    # Остання закрита свічка = confirmation.
-    confirm = candles[-1]
-    exhaustion = candles[-2]
-
-    if body_pct(confirm) < MIN_BODY_PCT:
-        return None
-
-    confirm_color = candle_color(confirm)
-    exhaustion_color = candle_color(exhaustion)
-
-    if confirm_color not in ("GREEN", "RED"):
-        return None
-
-    # Шукаємо серію безпосередньо перед exhaustion.
-    run_color = exhaustion_color
-    run_len = 0
-
-    for c in reversed(candles[:-2]):
-        if candle_color(c) == run_color:
-            run_len += 1
-        else:
-            break
-
-    # Цікавить саме 4-6 однакових свічок.
-    if run_len < 4 or run_len > 6:
-        return None
-
-    # Для розвороту confirmation має бути протилежного кольору.
-    if confirm_color == exhaustion_color:
-        return None
-
-    series = candles[-2 - run_len:-2]
-
-    if len(series) < 4:
-        return None
-
-    bodies = [body(x) for x in series]
-
-    # Середнє тіло серії.
-    avg_body = sum(bodies) / max(len(bodies), 1)
-
-    # Остання свічка серії має бути не надто великою:
-    # ознака виснаження.
-    exhaustion_ratio = body(exhaustion) / max(avg_body, 1e-12)
-
-    # Якщо остання свічка ще більша за всю серію — це частіше імпульс,
-    # а не виснаження.
-    if exhaustion_ratio > 1.35:
-        return None
-
-    # Бажано, щоб тіло останньої свічки було меншим.
-    shrinking = body(exhaustion) <= max(
-        body(series[-1]) * 0.90,
-        avg_body * 0.90,
-    )
-
-    # Confirmation повинна пробити екстремум exhaustion.
-    bullish_confirmation = (
-        exhaustion_color == "RED"
-        and confirm_color == "GREEN"
-        and confirm["close"] > exhaustion["high"]
-    )
-
-    bearish_confirmation = (
-        exhaustion_color == "GREEN"
-        and confirm_color == "RED"
-        and confirm["close"] < exhaustion["low"]
-    )
-
-    if not bullish_confirmation and not bearish_confirmation:
-        return None
-
-    closes = [x["close"] for x in candles]
-
-    ma5 = sma(closes, 5)
-    ma14 = sma(closes, 14)
-    ma30 = sma(closes, 30)
-
-    if ma5 is None or ma14 is None or ma30 is None:
-        return None
-
-    atr14 = atr(candles, 14)
-
-    if atr14 is None or atr14 <= 0:
-        return None
-
-    # Не беремо надто "мертві" монети:
-    # для TP 0.5-0.7% потрібна хоч якась волатильність.
-    atr_pct = atr14 / max(confirm["close"], 1e-12)
-
-    if atr_pct < 0.0008:  # 0.08%
-        return None
-
-    direction = "LONG" if bullish_confirmation else "SHORT"
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-    score = 0
-    reasons = []
-
-    # 1. Серія 4-6
-    score += 25
-    reasons.append(f"{run_len} однакових свічок")
-
-    # 2. Виснаження
-    if shrinking:
-        score += 15
-        reasons.append("тіло зменшилось")
-    else:
-        score += 5
-
-    # 3. Confirmation
-    score += 25
-    reasons.append("є пробій exhaustion")
-
-    # 4. MA5
+def htf_zone(df, direction):
+    recent = df.iloc[-ZONE_LOOKBACK:].copy()
     if direction == "LONG":
-        if confirm["close"] > ma5:
-            score += 10
-            reasons.append("ціна > MA5")
+        # Last bearish candle before an impulsive bullish displacement.
+        for i in range(len(recent)-4, 2, -1):
+            c = recent.iloc[i]
+            nxt = recent.iloc[i+1:i+4]
+            if c.close < c.open and float(nxt.close.max()) > c.high * 1.003:
+                return float(c.low), float(c.high), "1H demand/OB"
+        return float(recent.low.min()), float(recent.low.quantile(.25)), "1H demand range"
     else:
-        if confirm["close"] < ma5:
-            score += 10
-            reasons.append("ціна < MA5")
+        for i in range(len(recent)-4, 2, -1):
+            c = recent.iloc[i]
+            nxt = recent.iloc[i+1:i+4]
+            if c.close > c.open and float(nxt.close.min()) < c.low * 0.997:
+                return float(c.low), float(c.high), "1H supply/OB"
+        return float(recent.high.quantile(.75)), float(recent.high.max()), "1H supply range"
 
-    # 5. MA14
+def liquidity_sweep(df, direction):
+    # Look for a wick through a recent swing and close back inside.
+    n = min(SWEEP_LOOKBACK, len(df)-5)
+    recent = df.iloc[-(n+3):].copy()
+    lows = pivot_lows(recent, 2, 2)
+    highs = pivot_highs(recent, 2, 2)
+    if direction == "LONG" and lows:
+        level = lows[-1][1]
+        for i in range(max(2, len(recent)-6), len(recent)):
+            c = recent.iloc[i]
+            if c.low < level and c.close > level:
+                return True, level, "sell-side liquidity sweep"
+    if direction == "SHORT" and highs:
+        level = highs[-1][1]
+        for i in range(max(2, len(recent)-6), len(recent)):
+            c = recent.iloc[i]
+            if c.high > level and c.close < level:
+                return True, level, "buy-side liquidity sweep"
+    return False, None, "no recent liquidity sweep"
+
+def choch_bos(df, direction):
+    # After the sweep, require a close through a nearby opposing pivot.
+    highs = pivot_highs(df, 2, 2)
+    lows = pivot_lows(df, 2, 2)
+    if direction == "LONG" and highs:
+        level = highs[-1][1]
+        if float(df.close.iloc[-1]) > level:
+            return True, level, "15m bullish CHoCH/BOS"
+    if direction == "SHORT" and lows:
+        level = lows[-1][1]
+        if float(df.close.iloc[-1]) < level:
+            return True, level, "15m bearish CHoCH/BOS"
+    return False, None, "CHoCH/BOS not confirmed"
+
+def find_poi_fvg(df, direction):
+    start = max(3, len(df)-10)
+    for i in range(len(df)-1, start-1, -1):
+        if direction == "LONG" and fvg_bull(df, i):
+            # FVG zone between candle i-2 high and candle i low.
+            return float(df.high.iloc[i-2]), float(df.low.iloc[i]), "15m bullish FVG"
+        if direction == "SHORT" and fvg_bear(df, i):
+            return float(df.high.iloc[i]), float(df.low.iloc[i-2]), "15m bearish FVG"
+    # fallback to last opposite candle as POI
+    for i in range(len(df)-2, start-1, -1):
+        c = df.iloc[i]
+        if direction == "LONG" and c.close < c.open:
+            return float(c.low), float(c.high), "15m bearish candle POI"
+        if direction == "SHORT" and c.close > c.open:
+            return float(c.low), float(c.high), "15m bullish candle POI"
+    return None, None, "no POI/FVG"
+
+def make_signal(symbol, d1h, d15):
+    direction, bias_reason = htf_direction(d1h)
+    if not direction:
+        return None
+
+    zlow, zhigh, zone_reason = htf_zone(d1h, direction)
+    price = float(d15.close.iloc[-1])
+
+    # The setup must be near the HTF zone; avoid chasing a distant breakout.
+    atr15 = atr(d15, ATR_PERIOD)
+    if not math.isfinite(atr15) or atr15 <= 0:
+        return None
+
+    zone_distance = 1.5 * atr15
     if direction == "LONG":
-        if confirm["close"] > ma14:
-            score += 5
-            reasons.append("ціна > MA14")
+        near_zone = price >= zlow - zone_distance and price <= zhigh + zone_distance
     else:
-        if confirm["close"] < ma14:
-            score += 5
-            reasons.append("ціна < MA14")
+        near_zone = price >= zlow - zone_distance and price <= zhigh + zone_distance
+    if not near_zone:
+        return None
 
-    # 6. MA30
+    swept, sweep_level, sweep_reason = liquidity_sweep(d15, direction)
+    if not swept:
+        return None
+
+    confirmed, break_level, choch_reason = choch_bos(d15, direction)
+    if not confirmed:
+        return None
+
+    plow, phigh, poi_reason = find_poi_fvg(d15, direction)
+    if plow is None:
+        return None
+
+    # Entry is the midpoint of the POI/FVG, with a tolerance around current price.
+    entry = (plow + phigh) / 2
+    if abs(price-entry) > 1.25 * atr15:
+        return None
+
     if direction == "LONG":
-        if confirm["close"] > ma30:
-            score += 5
-            reasons.append("ціна > MA30")
+        sl = min(sweep_level, plow) - SL_ATR_BUFFER * atr15
+        risk = entry - sl
+        if risk <= 0:
+            return None
+        tp1 = entry + risk * TP1_RR
+        tp2 = entry + risk * TP2_RR
     else:
-        if confirm["close"] < ma30:
-            score += 5
-            reasons.append("ціна < MA30")
+        sl = max(sweep_level, phigh) + SL_ATR_BUFFER * atr15
+        risk = sl - entry
+        if risk <= 0:
+            return None
+        tp1 = entry - risk * TP1_RR
+        tp2 = entry - risk * TP2_RR
 
-    # 7. Confirmation body достатній.
-    confirm_body_ratio = body(confirm) / max(body(exhaustion), 1e-12)
+    rr2 = abs(tp2-entry) / risk
+    if rr2 < MIN_RR:
+        return None
 
-    if confirm_body_ratio >= 1.0:
-        score += 10
-        reasons.append("сильна confirmation-свічка")
-    elif confirm_body_ratio >= 0.70:
-        score += 5
-
-    # 8. Бонус за співвідношення тіла до range.
-    body_range_ratio = body(confirm) / max(range_size(confirm), 1e-12)
-    if body_range_ratio >= 0.60:
-        score += 5
-        reasons.append("сильне тіло")
+    # Entry should not be absurdly far from live price.
+    entry_distance_pct = abs(price-entry) / price * 100
+    if entry_distance_pct > 1.0:
+        return None
 
     return {
+        "symbol": symbol,
         "direction": direction,
-        "score": min(score, 100),
-        "run_len": run_len,
-        "confirm_time": confirm["time"],
-        "entry": confirm["close"],
-        "ma5": ma5,
-        "ma14": ma14,
-        "ma30": ma30,
-        "atr_pct": atr_pct,
-        "reasons": reasons,
-        "series": series,
-        "exhaustion": exhaustion,
-        "confirmation": confirm,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr": rr2,
+        "price": price,
+        "bias_reason": bias_reason,
+        "zone_reason": zone_reason,
+        "sweep_reason": sweep_reason,
+        "choch_reason": choch_reason,
+        "poi_reason": poi_reason,
+        "sweep_level": sweep_level,
+        "time": int(d15.time.iloc[-1]),
     }
-
-
-# ============================================================
-#                 HIGHER TF FILTER
-# ============================================================
-
-def higher_tf_score(symbol, base_signal):
-    """
-    Для кандидата дивимося 15m + 1h.
-    Не вимагаємо повної однаковості тренду, бо патерн шукає
-    короткий рух 0.5-0.7%, у тому числі від локального розвороту.
-    """
-
-    k15 = get_klines(symbol, TF_15M, 80)
-    k1h = get_klines(symbol, TF_1H, 80)
-
-    if len(k15) < 35 or len(k1h) < 35:
-        return None
-
-    def tf_state(k):
-        closes = [x["close"] for x in k]
-        last = closes[-1]
-        ma5 = sma(closes, 5)
-        ma14 = sma(closes, 14)
-        ma30 = sma(closes, 30)
-
-        if None in (ma5, ma14, ma30):
-            return 0, "N/A"
-
-        if base_signal["direction"] == "LONG":
-            points = 0
-            if last > ma5:
-                points += 1
-            if ma5 > ma14:
-                points += 1
-            if last > ma30:
-                points += 1
-
-            if points == 3:
-                return 3, "bull"
-            if points == 2:
-                return 2, "bull/neutral"
-            if points == 1:
-                return 1, "neutral"
-            return 0, "bear"
-
-        else:
-            points = 0
-            if last < ma5:
-                points += 1
-            if ma5 < ma14:
-                points += 1
-            if last < ma30:
-                points += 1
-
-            if points == 3:
-                return 3, "bear"
-            if points == 2:
-                return 2, "bear/neutral"
-            if points == 1:
-                return 1, "neutral"
-            return 0, "bull"
-
-    s15, state15 = tf_state(k15)
-    s1h, state1h = tf_state(k1h)
-
-    bonus = 0
-
-    if s15 >= 2:
-        bonus += 8
-
-    if s1h >= 2:
-        bonus += 7
-
-    return {
-        "score_bonus": bonus,
-        "score15": s15,
-        "score1h": s1h,
-        "state15": state15,
-        "state1h": state1h,
-    }
-
-
-# ============================================================
-#                 SIGNAL
-# ============================================================
-
-def make_signal(symbol):
-    k5 = get_klines(symbol, TF_5M, 120)
-
-    if len(k5) < 70:
-        return None
-
-    signal = find_base_pattern(k5)
-
-    if not signal:
-        return None
-
-    if signal["score"] < 65:
-        return None
-
-    # 10m — додаткова локальна перевірка.
-    k10 = aggregate_10m_from_5m(k5)
-
-    if len(k10) >= 30:
-        closes10 = [x["close"] for x in k10]
-        ma5_10 = sma(closes10, 5)
-
-        if ma5_10 is not None:
-            if signal["direction"] == "LONG" and k10[-1]["close"] > ma5_10:
-                signal["score"] += 5
-                signal["reasons"].append("10m > MA5")
-            elif signal["direction"] == "SHORT" and k10[-1]["close"] < ma5_10:
-                signal["score"] += 5
-                signal["reasons"].append("10m < MA5")
-
-    # 15m + 1h.
-    ht = higher_tf_score(symbol, signal)
-
-    if not ht:
-        return None
-
-    signal["score"] = min(signal["score"] + ht["score_bonus"], 100)
-    signal["higher"] = ht
-
-    if signal["score"] < MIN_SCORE:
-        return None
-
-    entry = signal["entry"]
-
-    if signal["direction"] == "LONG":
-        tp1 = entry * 1.005
-        tp2 = entry * 1.007
-
-        # Орієнтовний invalidation:
-        invalidation = signal["exhaustion"]["low"]
-
-    else:
-        tp1 = entry * 0.995
-        tp2 = entry * 0.993
-        invalidation = signal["exhaustion"]["high"]
-
-    signal["symbol"] = symbol
-    signal["tp1"] = tp1
-    signal["tp2"] = tp2
-    signal["invalidation"] = invalidation
-    signal["tf"] = "5m → 10m → 15m → 1h"
-
-    return signal
-
 
 def fmt_price(x):
-    if x >= 1000:
-        return f"{x:.2f}"
-    if x >= 100:
-        return f"{x:.3f}"
-    if x >= 10:
-        return f"{x:.4f}"
-    if x >= 1:
-        return f"{x:.5f}"
+    if x >= 1000: return f"{x:.2f}"
+    if x >= 1: return f"{x:.4f}"
+    if x >= .01: return f"{x:.6f}"
     return f"{x:.8f}"
 
+def telegram_send(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Telegram credentials are not configured")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+    r.raise_for_status()
 
-def build_message(signal):
-    direction = signal["direction"]
-
-    if direction == "LONG":
-        icon = "🟢"
-        side = "LONG"
-    else:
-        icon = "🔴"
-        side = "SHORT"
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    h = signal["higher"]
-
-    reasons = ", ".join(signal["reasons"])
-
+def render_signal(s):
+    arrow = "🟢 LONG" if s["direction"] == "LONG" else "🔴 SHORT"
     return (
-        f"{icon} СИГНАЛ {side}\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"Монета: {signal['symbol']}\n"
-        f"TF: {signal['tf']}\n"
-        f"Score: {signal['score']}/100\n\n"
-        f"Вхід: {fmt_price(signal['entry'])}\n"
-        f"TP1 +0.50%: {fmt_price(signal['tp1'])}\n"
-        f"TP2 +0.70%: {fmt_price(signal['tp2'])}\n"
-        f"Invalidation: {fmt_price(signal['invalidation'])}\n\n"
-        f"Патерн: {signal['run_len']} однакових → "
-        f"виснаження → confirmation\n"
-        f"MA5: {fmt_price(signal['ma5'])}\n"
-        f"MA14: {fmt_price(signal['ma14'])}\n"
-        f"MA30: {fmt_price(signal['ma30'])}\n"
-        f"ATR(14): {signal['atr_pct'] * 100:.2f}%\n\n"
-        f"15m: {h['state15']} ({h['score15']}/3)\n"
-        f"1h: {h['state1h']} ({h['score1h']}/3)\n"
-        f"Причини: {reasons}\n\n"
-        f"Час: {now}\n"
-        f"⚠️ Це технічний сигнал бота, не гарантія результату."
+        f"🎯 ENTRY POINT FOUND\n\n"
+        f"{arrow}  {s['symbol']}\n\n"
+        f"Entry: {fmt_price(s['entry'])}\n"
+        f"SL:    {fmt_price(s['sl'])}\n"
+        f"TP1:   {fmt_price(s['tp1'])}\n"
+        f"TP2:   {fmt_price(s['tp2'])}\n"
+        f"RR:    1:{s['rr']:.2f}\n\n"
+        f"✅ 1H: {s['bias_reason']}\n"
+        f"✅ Zone: {s['zone_reason']}\n"
+        f"✅ Sweep: {s['sweep_reason']}\n"
+        f"✅ Structure: {s['choch_reason']}\n"
+        f"✅ POI: {s['poi_reason']}\n\n"
+        f"Current: {fmt_price(s['price'])}\n"
+        f"Mode: alert-only"
     )
-
-
-def should_send(signal):
-    key = (
-        signal["symbol"],
-        signal["tf"],
-        signal["direction"],
-    )
-
-    candle_time = signal["confirm_time"]
-    now = time.time()
-
-    # Не повторювати ту саму confirmation candle.
-    if last_sent.get(key) == candle_time:
-        return False
-
-    # Додатковий cooldown.
-    if now - last_sent_time.get(key, 0) < COOLDOWN_MINUTES * 60:
-        return False
-
-    last_sent[key] = candle_time
-    last_sent_time[key] = now
-    return True
-
-
-# ============================================================
-#                 SCANNER
-# ============================================================
-
-def choose_symbols():
-    symbols = get_contracts()
-
-    if not symbols:
-        print("[ERROR] Не вдалося отримати список контрактів.")
-        return []
-
-    # Якщо 0 — буквально всі.
-    if MAX_SYMBOLS == 0:
-        return symbols
-
-    tickers = get_tickers()
-
-    if tickers:
-        symbols = sorted(
-            symbols,
-            key=lambda s: tickers.get(s, 0),
-            reverse=True,
-        )
-
-    return symbols[:MAX_SYMBOLS]
-
 
 def scan_one(symbol):
     try:
-        return make_signal(symbol)
+        d1h = get_klines(symbol, "Min60", 220)
+        d15 = get_klines(symbol, "Min15", 220)
+        return make_signal(symbol, d1h, d15)
     except Exception as e:
-        print(f"[SCAN ERROR] {symbol}: {e}")
+        logging.warning("%s: %s", symbol, e)
         return None
 
-
-def run_scan():
-    start = time.time()
-
-    symbols = choose_symbols()
-
-    if not symbols:
-        return
-
-    print(
-        f"\n[{datetime.now().strftime('%H:%M:%S')}] "
-        f"Сканую {len(symbols)} контрактів..."
-    )
-
-    found = 0
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(scan_one, symbol): symbol
-            for symbol in symbols
-        }
-
-        for future in as_completed(futures):
-            symbol = futures[future]
-
-            try:
-                signal = future.result()
-            except Exception as e:
-                print(f"[WORKER ERROR] {symbol}: {e}")
-                continue
-
-            if not signal:
-                continue
-
-            found += 1
-
-            if should_send(signal):
-                msg = build_message(signal)
-                print("\n" + msg + "\n")
-                telegram_send(msg)
-
-    elapsed = time.time() - start
-
-    print(
-        f"[DONE] Кандидатів: {found} | "
-        f"Час циклу: {elapsed:.1f} сек."
-    )
-
-
-# ============================================================
-#                 MAIN
-# ============================================================
+def should_send(s):
+    key = f"{s['symbol']}:{s['direction']}"
+    now = time.time()
+    if now - last_sent.get(key, 0) < COOLDOWN_MINUTES * 60:
+        return False
+    last_sent[key] = now
+    return True
 
 def main():
-    print("==============================================")
-    print(" MEXC FUTURES SIGNAL BOT")
-    print(" 5m -> 10m -> 15m -> 1h")
-    print(" Telegram alerts only")
-    print("==============================================")
-
-    if "ВСТАВ" in TELEGRAM_BOT_TOKEN:
-        print("\n[!] Спочатку встав TELEGRAM_BOT_TOKEN")
-    if "ВСТАВ" in str(TELEGRAM_CHAT_ID):
-        print("[!] Спочатку встав TELEGRAM_CHAT_ID\n")
-
-    if SEND_STARTUP_MESSAGE:
-        telegram_send(
-            "🤖 MEXC Signal Bot запущений.\n"
-            "Сканування: MEXC Futures\n"
-            "Патерн: 4-6 однакових → виснаження → confirmation\n"
-            "TP1: +0.50%\n"
-            "TP2: +0.70%\n"
-            f"MIN_SCORE: {MIN_SCORE}/100"
-        )
+    logging.info("ENTRY POINT BOT started | 30 coins | 1H ZONE + SWEEP + CHoCH + POI/FVG")
+    logging.info("MEXC=%s | poll=%ss | cooldown=%smin", MEXC_BASE, SCAN_SECONDS, COOLDOWN_MINUTES)
+    active = get_contracts()
+    symbols = [symbol_for(c) for c in COINS if symbol_for(c) in active]
+    logging.info("Active symbols: %s/%s", len(symbols), len(COINS))
+    missing = [symbol_for(c) for c in COINS if symbol_for(c) not in active]
+    if missing:
+        logging.warning("Unavailable symbols: %s", ", ".join(missing))
 
     while True:
-        try:
-            started = time.time()
-
-            run_scan()
-
-            elapsed = time.time() - started
-            sleep_for = max(5, SCAN_SECONDS - elapsed)
-
-            print(f"[WAIT] Наступний цикл через {sleep_for:.1f} сек.")
-            time.sleep(sleep_for)
-
-        except KeyboardInterrupt:
-            print("\n[STOP] Бот зупинений.")
-            break
-
-        except Exception as e:
-            print(f"[MAIN ERROR] {e}")
-            time.sleep(10)
-
+        started = time.time()
+        found = 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = [ex.submit(scan_one, s) for s in symbols]
+            for f in as_completed(futures):
+                signal = f.result()
+                if signal and should_send(signal):
+                    try:
+                        telegram_send(render_signal(signal))
+                        found += 1
+                        logging.info("SIGNAL SENT: %s %s", signal["symbol"], signal["direction"])
+                    except Exception as e:
+                        logging.error("Telegram error: %s", e)
+        elapsed = time.time() - started
+        logging.info("scan complete | %.1fs | signals=%s", elapsed, found)
+        time.sleep(max(1, SCAN_SECONDS - elapsed))
 
 if __name__ == "__main__":
     main()
