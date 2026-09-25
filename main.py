@@ -249,9 +249,10 @@ def find_poi_fvg(df, direction):
     return None, None, "no POI/FVG"
 
 def make_signal(symbol, d1h, d15):
+    """Return (signal, stage) where stage explains the first failed filter."""
     direction, bias_reason = htf_direction(d1h)
     if not direction:
-        return None
+        return None, "1H_BIAS"
 
     zlow, zhigh, zone_reason = htf_zone(d1h, direction)
     price = float(d15.close.iloc[-1])
@@ -259,7 +260,7 @@ def make_signal(symbol, d1h, d15):
     # The setup must be near the HTF zone; avoid chasing a distant breakout.
     atr15 = atr(d15, ATR_PERIOD)
     if not math.isfinite(atr15) or atr15 <= 0:
-        return None
+        return None, "ATR"
 
     zone_distance = 1.5 * atr15
     if direction == "LONG":
@@ -267,48 +268,48 @@ def make_signal(symbol, d1h, d15):
     else:
         near_zone = price >= zlow - zone_distance and price <= zhigh + zone_distance
     if not near_zone:
-        return None
+        return None, "HTF_ZONE_DISTANCE"
 
     swept, sweep_level, sweep_reason = liquidity_sweep(d15, direction)
     if not swept:
-        return None
+        return None, "LIQUIDITY_SWEEP"
 
     confirmed, break_level, choch_reason = choch_bos(d15, direction)
     if not confirmed:
-        return None
+        return None, "CHOCH_BOS"
 
     plow, phigh, poi_reason = find_poi_fvg(d15, direction)
     if plow is None:
-        return None
+        return None, "POI_FVG"
 
     # Entry is the midpoint of the POI/FVG, with a tolerance around current price.
     entry = (plow + phigh) / 2
     if abs(price-entry) > 1.25 * atr15:
-        return None
+        return None, "ENTRY_DISTANCE_ATR"
 
     if direction == "LONG":
         sl = min(sweep_level, plow) - SL_ATR_BUFFER * atr15
         risk = entry - sl
         if risk <= 0:
-            return None
+            return None, "INVALID_RISK"
         tp1 = entry + risk * TP1_RR
         tp2 = entry + risk * TP2_RR
     else:
         sl = max(sweep_level, phigh) + SL_ATR_BUFFER * atr15
         risk = sl - entry
         if risk <= 0:
-            return None
+            return None, "INVALID_RISK"
         tp1 = entry - risk * TP1_RR
         tp2 = entry - risk * TP2_RR
 
     rr2 = abs(tp2-entry) / risk
     if rr2 < MIN_RR:
-        return None
+        return None, "RR"
 
     # Entry should not be absurdly far from live price.
     entry_distance_pct = abs(price-entry) / price * 100
     if entry_distance_pct > 1.0:
-        return None
+        return None, "ENTRY_DISTANCE_PCT"
 
     return {
         "symbol": symbol,
@@ -326,7 +327,7 @@ def make_signal(symbol, d1h, d15):
         "poi_reason": poi_reason,
         "sweep_level": sweep_level,
         "time": int(d15.time.iloc[-1]),
-    }
+    }, "SIGNAL_READY"
 
 def fmt_price(x):
     if x >= 1000: return f"{x:.2f}"
@@ -366,8 +367,8 @@ def scan_one(symbol):
         d15 = get_klines(symbol, "Min15", 220)
         return make_signal(symbol, d1h, d15)
     except Exception as e:
-        logging.warning("%s: %s", symbol, e)
-        return None
+        logging.warning("DIAG %s | API/DATA_ERROR | %s", symbol, e)
+        return None, "API/DATA_ERROR"
 
 def should_send(s):
     key = f"{s['symbol']}:{s['direction']}"
@@ -392,19 +393,30 @@ def main():
     while True:
         started = time.time()
         found = 0
+        stages = {}
         # Deliberately scan sequentially. Two candle requests per symbol
         # are enough to trigger MEXC IP throttling when sent concurrently.
         for s in symbols:
-            signal = scan_one(s)
-            if signal and should_send(signal):
-                try:
-                    telegram_send(render_signal(signal))
-                    found += 1
-                    logging.info("SIGNAL SENT: %s %s", signal["symbol"], signal["direction"])
-                except Exception as e:
-                    logging.error("Telegram error: %s", e)
+            signal, stage = scan_one(s)
+            stages[stage] = stages.get(stage, 0) + 1
+            if signal:
+                logging.info(
+                    "DIAG %s | READY | %s | Entry=%s | SL=%s | TP2=%s | RR=%.2f",
+                    s, signal["direction"], fmt_price(signal["entry"]),
+                    fmt_price(signal["sl"]), fmt_price(signal["tp2"]), signal["rr"]
+                )
+                if should_send(signal):
+                    try:
+                        telegram_send(render_signal(signal))
+                        found += 1
+                        logging.info("SIGNAL SENT: %s %s", signal["symbol"], signal["direction"])
+                    except Exception as e:
+                        logging.error("Telegram error: %s", e)
+            else:
+                logging.info("DIAG %s | REJECT | %s", s, stage)
         elapsed = time.time() - started
-        logging.info("scan complete | %.1fs | signals=%s", elapsed, found)
+        breakdown = " | ".join(f"{k}={v}" for k, v in sorted(stages.items()))
+        logging.info("scan complete | %.1fs | signals=%s | filters: %s", elapsed, found, breakdown)
         time.sleep(max(1, SCAN_SECONDS - elapsed))
 
 if __name__ == "__main__":

@@ -32,3 +32,7 @@ Railway:
 
 ### Rate-limit protection
 The bot scans sequentially and spaces public MEXC requests by 1.2 seconds. HTTP 510 triggers 8/16/24/32-second backoff retries.
+
+
+### Diagnostic mode
+Every scan now logs the first filter that rejected each symbol: `1H_BIAS`, `HTF_ZONE_DISTANCE`, `LIQUIDITY_SWEEP`, `CHOCH_BOS`, `POI_FVG`, `ENTRY_DISTANCE_ATR`, `RR`, etc. The final scan line includes an aggregated filter breakdown. This does not send diagnostic messages to Telegram.
