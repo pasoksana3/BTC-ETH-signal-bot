@@ -35,7 +35,7 @@ from urllib.error import HTTPError, URLError
 #                 НАЛАШТУВАННЯ — ЗАПОВНИ ЦЕ
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = "ВСТАВ_СЮДИ_ТОКЕН_ВІД_BOTFATHER"
+TELEGRAM_BOT_TOKEN = "8812030381:AAG-8ZTc-xG824MCUosIwoMjsHNVhb-2-Lc"
 TELEGRAM_CHAT_ID = "-5417788354"
 
 # Як часто запускати повний цикл.
@@ -125,11 +125,11 @@ def http_json(url, params=None, timeout=15):
 # ============================================================
 
 def telegram_send(text):
-    if not TELEGRAM_BOT_TOKEN or "ВСТАВ" in TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN or "8812030381:AAG-8ZTc-xG824MCUosIwoMjsHNVhb-2-Lc" in TELEGRAM_BOT_TOKEN:
         print("[TELEGRAM] Не заданий TELEGRAM_BOT_TOKEN")
         return False
 
-    if not TELEGRAM_CHAT_ID or "ВСТАВ" in str(TELEGRAM_CHAT_ID):
+    if not TELEGRAM_CHAT_ID or "-5417788354" in str(TELEGRAM_CHAT_ID):
         print("[TELEGRAM] Не заданий TELEGRAM_CHAT_ID")
         return False
 
