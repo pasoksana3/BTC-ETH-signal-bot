@@ -29,3 +29,6 @@ Railway:
 4. Start command: python main.py
 
 Перш ніж використовувати сигнали на реальних грошах, перевір їх на історичних даних/демо-режимі. Стратегія не гарантує прибуток.
+
+## API rate-limit fix
+The scanner uses a shared request gate, retries MEXC 510 with exponential backoff, and limits worker concurrency to reduce burst traffic.
