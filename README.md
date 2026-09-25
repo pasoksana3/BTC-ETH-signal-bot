@@ -36,3 +36,11 @@ The bot scans sequentially and spaces public MEXC requests by 1.2 seconds. HTTP 
 
 ### Diagnostic mode
 Every scan now logs the first filter that rejected each symbol: `1H_BIAS`, `HTF_ZONE_DISTANCE`, `LIQUIDITY_SWEEP`, `CHOCH_BOS`, `POI_FVG`, `ENTRY_DISTANCE_ATR`, `RR`, etc. The final scan line includes an aggregated filter breakdown. This does not send diagnostic messages to Telegram.
+
+
+### V2 adaptive HTF zone distance
+The diagnostic build now uses an adaptive 2.0-3.0 ATR envelope around the 1H HTF zone instead of the fixed 1.5 ATR distance. The rest of the confirmation chain remains intact: liquidity sweep -> CHoCH/BOS -> POI/FVG -> entry distance -> RR.
+
+Environment overrides:
+- `ZONE_DISTANCE_ATR_MIN=2.0`
+- `ZONE_DISTANCE_ATR_MAX=3.0`

@@ -34,6 +34,8 @@ MIN_RR = float(os.getenv("MIN_RR", "1.5"))
 TP1_RR = float(os.getenv("TP1_RR", "1.5"))
 TP2_RR = float(os.getenv("TP2_RR", "2.2"))
 SL_ATR_BUFFER = float(os.getenv("SL_ATR_BUFFER", "0.15"))
+ZONE_DISTANCE_ATR_MIN = float(os.getenv("ZONE_DISTANCE_ATR_MIN", "2.0"))
+ZONE_DISTANCE_ATR_MAX = float(os.getenv("ZONE_DISTANCE_ATR_MAX", "3.0"))
 
 COINS = [
     "BTC","ETH","SOL","XRP","DOGE","SUI","AVAX","LINK","DOT","LTC",
@@ -262,7 +264,15 @@ def make_signal(symbol, d1h, d15):
     if not math.isfinite(atr15) or atr15 <= 0:
         return None, "ATR"
 
-    zone_distance = 1.5 * atr15
+    # Adaptive HTF-zone distance: allow a wider approach in higher-volatility markets,
+    # while keeping a bounded ATR window so the bot does not chase arbitrary breakouts.
+    # The current implementation uses a 2.0-3.0 ATR envelope based on recent 15m volatility.
+    atr_fast = atr(d15, max(7, ATR_PERIOD // 2))
+    vol_ratio = atr_fast / atr15 if math.isfinite(atr_fast) and atr15 > 0 else 1.0
+    vol_ratio = max(0.85, min(1.25, vol_ratio))
+    zone_atr_mult = ZONE_DISTANCE_ATR_MIN + (vol_ratio - 0.85) / (1.25 - 0.85) * (ZONE_DISTANCE_ATR_MAX - ZONE_DISTANCE_ATR_MIN)
+    zone_atr_mult = max(ZONE_DISTANCE_ATR_MIN, min(ZONE_DISTANCE_ATR_MAX, zone_atr_mult))
+    zone_distance = zone_atr_mult * atr15
     if direction == "LONG":
         near_zone = price >= zlow - zone_distance and price <= zhigh + zone_distance
     else:
