@@ -1,5 +1,5 @@
 
-import os, time, math, logging, asyncio
+import os, time, math, logging, asyncio, threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -18,7 +18,11 @@ MEXC_BASE = os.getenv("MEXC_BASE", "https://api.mexc.com")
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+MAX_WORKERS = 1
+API_MIN_INTERVAL = float(os.getenv("API_MIN_INTERVAL", "1.20"))
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "4"))
+_api_lock = threading.Lock()
+_api_last_request = 0.0
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "45"))
 
 # Entry-quality filters
@@ -37,6 +41,8 @@ COINS = [
     "SEI","TRX","NEAR","PYTH","ADA","ENA","BNB","BCH","ETC","XLM"
 ]
 
+FALLBACK_COINS = ["TAO","RENDER","KAS","ONDO","AAVE","MKR","CRV","GRT","JUP","TIA","IMX","RUNE","LDO","SAND","MANA","GALA","HBAR","FTM","SUSHI","ZEC"]
+
 session = requests.Session()
 session.headers.update({"Content-Type": "application/json", "User-Agent": "MEXC-EntryPoint-Bot/1.0"})
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -47,12 +53,37 @@ def symbol_for(coin):
     return f"{coin}_USDT"
 
 def mexc_get(path, params=None):
-    r = session.get(MEXC_BASE + path, params=params or {}, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and data.get("success") is False:
-        raise RuntimeError(str(data))
-    return data
+    global _api_last_request
+    last_error = None
+    for attempt in range(API_MAX_RETRIES):
+        with _api_lock:
+            wait = API_MIN_INTERVAL - (time.monotonic() - _api_last_request)
+            if wait > 0:
+                time.sleep(wait)
+            _api_last_request = time.monotonic()
+        try:
+            r = session.get(MEXC_BASE + path, params=params or {}, timeout=20)
+            data = r.json()
+            code = data.get("code") if isinstance(data, dict) else None
+            if code == 510:
+                # Back off aggressively because MEXC may keep the IP throttled
+                # for a short period after a burst.
+                delay = 8.0 * (attempt + 1)
+                logging.warning("MEXC 510 rate limit on %s; waiting %.1fs", path, delay)
+                time.sleep(delay)
+                last_error = RuntimeError(str(data))
+                continue
+            r.raise_for_status()
+            if isinstance(data, dict) and data.get("success") is False:
+                raise RuntimeError(str(data))
+            return data
+        except (requests.RequestException, ValueError) as e:
+            last_error = e
+            if attempt < API_MAX_RETRIES - 1:
+                time.sleep(3.0 * (attempt + 1))
+            else:
+                raise
+    raise last_error or RuntimeError("MEXC request failed")
 
 def get_contracts():
     data = mexc_get("/api/v1/contract/detail")
@@ -350,26 +381,28 @@ def main():
     logging.info("ENTRY POINT BOT started | 30 coins | 1H ZONE + SWEEP + CHoCH + POI/FVG")
     logging.info("MEXC=%s | poll=%ss | cooldown=%smin", MEXC_BASE, SCAN_SECONDS, COOLDOWN_MINUTES)
     active = get_contracts()
-    symbols = [symbol_for(c) for c in COINS if symbol_for(c) in active]
-    logging.info("Active symbols: %s/%s", len(symbols), len(COINS))
+    preferred = [symbol_for(c) for c in COINS if symbol_for(c) in active]
     missing = [symbol_for(c) for c in COINS if symbol_for(c) not in active]
+    fallbacks = [symbol_for(c) for c in FALLBACK_COINS if symbol_for(c) in active and symbol_for(c) not in preferred]
+    symbols = (preferred + fallbacks)[:30]
+    logging.info("Active symbols: %s/30", len(symbols))
     if missing:
-        logging.warning("Unavailable symbols: %s", ", ".join(missing))
+        logging.warning("Unavailable preferred symbols: %s", ", ".join(missing))
 
     while True:
         started = time.time()
         found = 0
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = [ex.submit(scan_one, s) for s in symbols]
-            for f in as_completed(futures):
-                signal = f.result()
-                if signal and should_send(signal):
-                    try:
-                        telegram_send(render_signal(signal))
-                        found += 1
-                        logging.info("SIGNAL SENT: %s %s", signal["symbol"], signal["direction"])
-                    except Exception as e:
-                        logging.error("Telegram error: %s", e)
+        # Deliberately scan sequentially. Two candle requests per symbol
+        # are enough to trigger MEXC IP throttling when sent concurrently.
+        for s in symbols:
+            signal = scan_one(s)
+            if signal and should_send(signal):
+                try:
+                    telegram_send(render_signal(signal))
+                    found += 1
+                    logging.info("SIGNAL SENT: %s %s", signal["symbol"], signal["direction"])
+                except Exception as e:
+                    logging.error("Telegram error: %s", e)
         elapsed = time.time() - started
         logging.info("scan complete | %.1fs | signals=%s", elapsed, found)
         time.sleep(max(1, SCAN_SECONDS - elapsed))

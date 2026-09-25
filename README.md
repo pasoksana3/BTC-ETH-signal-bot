@@ -30,5 +30,5 @@ Railway:
 
 Перш ніж використовувати сигнали на реальних грошах, перевір їх на історичних даних/демо-режимі. Стратегія не гарантує прибуток.
 
-## API rate-limit fix
-The scanner uses a shared request gate, retries MEXC 510 with exponential backoff, and limits worker concurrency to reduce burst traffic.
+### Rate-limit protection
+The bot scans sequentially and spaces public MEXC requests by 1.2 seconds. HTTP 510 triggers 8/16/24/32-second backoff retries.
